@@ -53,7 +53,7 @@
 (defclass code-review-gitlab-repo (code-review-db-pullreq)
   ((callback :initform nil)))
 
- (defvar code-review-gitlab-line-diff-mapping nil
+(defvar code-review-gitlab-line-diff-mapping nil
   "Hold structure to convert Line number position into diff positions.
 For internal usage only.")
 
@@ -75,13 +75,14 @@ For internal usage only.")
 (defun code-review-gitlab--graphql (graphql variables callback)
   "Make GRAPHQL call to GITLAB.
 Optionally using VARIABLES.  Provide HOST and CALLBACK fn."
-  (glab-request "POST" "/graphql" nil :payload (json-encode
+  (ghub-request "POST" "/graphql" nil :payload (json-encode
                                                 `(("query" . ,graphql)
                                                   ,@(and variables `(("variables" ,@variables)))))
                 :auth code-review-auth-login-marker
                 :host code-review-gitlab-graphql-host
                 :callback callback
-                :errorback #'code-review-gitlab-errback))
+                :errorback #'code-review-gitlab-errback
+		:forge 'gitlab))
 
 ;;; Functions to standardize Gitlab returned datastructure to the ones used by
 ;;; Github, adopted as standard in the project conception :/.
@@ -278,7 +279,7 @@ The payload is used to send a MR review to Gitlab."
 
 (cl-defmethod code-review-pullreq-diff ((gitlab code-review-gitlab-repo) callback)
   "Get PR diff from GITLAB, run CALLBACK after answer."
-  (glab-get (format "/v4/projects/%s/merge_requests/%s/changes?access_raw_diffs=true"
+  (ghub-get (format "/v4/projects/%s/merge_requests/%s/changes?access_raw_diffs=true"
                     (code-review-gitlab--project-id gitlab)
                     (oref gitlab number))
             nil
@@ -286,7 +287,8 @@ The payload is used to send a MR review to Gitlab."
             :host code-review-gitlab-host
             :auth code-review-auth-login-marker
             :callback callback
-            :errorback #'code-review-gitlab-errback))
+            :errorback #'code-review-gitlab-errback
+	    :forge 'gitlab))
 
 (cl-defmethod code-review-diff-deferred ((gitlab code-review-gitlab-repo))
   "Get DIFF from GITLAB."
@@ -416,31 +418,32 @@ Optionally sets FALLBACK? to get minimal query."
   "Submit replies to review comments inline given REPLIES and a CALLBACK fn."
   (let ((pr (oref replies pr)))
     (deferred:$
-      (deferred:parallel
-        (-map
-         (lambda (reply)
-           (lambda ()
-             (glab-post (format "/v4/projects/%s/merge_requests/%s/discussions/%s/notes"
-                                (code-review-gitlab--project-id pr)
-                                (oref pr number)
-                                (oref reply reply-to-id))
-                        nil
-                        :payload (a-alist 'body (oref reply body))
-                        :auth code-review-auth-login-marker
-                        :host code-review-gitlab-host
-                        :errorback #'code-review-gitlab-errback
-                        :callback (lambda (&rest _)))))
-         (oref replies replies)))
+     (deferred:parallel
+      (-map
+       (lambda (reply)
+         (lambda ()
+           (ghub-post (format "/v4/projects/%s/merge_requests/%s/discussions/%s/notes"
+                              (code-review-gitlab--project-id pr)
+                              (oref pr number)
+                              (oref reply reply-to-id))
+                      nil
+                      :payload (a-alist 'body (oref reply body))
+                      :auth code-review-auth-login-marker
+                      :host code-review-gitlab-host
+                      :errorback #'code-review-gitlab-errback
+                      :callback (lambda (&rest _))
+		      :forge 'gitlab)))
+       (oref replies replies)))
 
-      (deferred:wait 500)
+     (deferred:wait 500)
 
-      (deferred:nextc it
-        (lambda (_x)
-          (funcall callback)))
+     (deferred:nextc it
+		     (lambda (_x)
+		       (funcall callback)))
 
-      (deferred:error it
-        (lambda (err)
-          (error "Got an error from the Gitlab Reply API %S!" err))))))
+     (deferred:error it
+		     (lambda (err)
+		       (error "Got an error from the Gitlab Reply API %S!" err))))))
 
 (defun code-review-gitlab--user ()
   "Get the user in the authinfo file."
@@ -463,7 +466,7 @@ Optionally sets FALLBACK? to get minimal query."
                                                   'start_sha (a-get-in infos (list 'diffRefs 'startSha))
                                                   'new_path (oref c path)
                                                   'old_path (oref c path)))))
-        (glab-post (format "/v4/projects/%s/merge_requests/%s/discussions"
+        (ghub-post (format "/v4/projects/%s/merge_requests/%s/discussions"
                            (code-review-gitlab--project-id pr)
                            (oref pr number))
                    nil
@@ -471,28 +474,31 @@ Optionally sets FALLBACK? to get minimal query."
                    :host code-review-gitlab-host
                    :payload (code-review-gitlab-fix-payload payload c)
                    :callback (lambda (&rest _)
-                               (message "Review Comments successfully!")))))
+                               (message "Review Comments successfully!"))
+		   :forge 'gitlab)))
     ;; 2. send the review verdict
     (pcase (oref review state)
       ("APPROVE"
-       (glab-post (format "/v4/projects/%s/merge_requests/%s/approve"
+       (ghub-post (format "/v4/projects/%s/merge_requests/%s/approve"
                           (code-review-gitlab--project-id pr)
                           (oref pr number))
                   nil
                   :auth code-review-auth-login-marker
                   :host code-review-gitlab-host
                   :payload `((sha . ,(a-get-in infos (list 'diffRefs 'headSha))))
-                  :username (code-review-gitlab--user)))
+                  :username (code-review-gitlab--user)
+		  :forge 'gitlab))
       ("REQUEST_CHANGES"
        (error "Not supported in Gitlab"))
       ("COMMENT"
-       (glab-post (format "/v4/projects/%s/merge_requests/%s/discussions"
+       (ghub-post (format "/v4/projects/%s/merge_requests/%s/discussions"
                           (code-review-gitlab--project-id pr)
                           (oref pr number))
                   nil
                   :auth code-review-auth-login-marker
                   :host code-review-gitlab-host
-                  :payload `((body . ,(oref review feedback))))
+                  :payload `((body . ,(oref review feedback)))
+		  :forge 'gitlab)
        (message "Review Comment successfully sent!")))
 
     ;; 3. call callback
@@ -509,17 +515,18 @@ Optionally sets FALLBACK? to get minimal query."
 
 (cl-defmethod code-review-get-assignable-users ((_gitlab code-review-gitlab-repo))
   "Get a list of assignable users for current PR at GITLAB."
-(code-review-gitlab-not-supported-message))
+  (code-review-gitlab-not-supported-message))
 
 (cl-defmethod code-review-get-labels ((gitlab code-review-gitlab-repo))
   "Get labels for your pr at GITLAB."
-  (let ((res (glab-get (format "/v4/projects/%s/labels"
+  (let ((res (ghub-get (format "/v4/projects/%s/labels"
                                (code-review-gitlab--project-id gitlab))
                        nil
                        :unpaginate t
                        :host code-review-gitlab-host
                        :auth code-review-auth-login-marker
-                       :noerror 'return)))
+                       :noerror 'return
+		       :forge 'giltab)))
     (if (a-get res 'error)
         (error (prin1-to-string res))
       (-map
@@ -531,14 +538,15 @@ Optionally sets FALLBACK? to get minimal query."
   "Set labels for your pr at GITLAB and call CALLBACK."
   (let* ((labels (-map (lambda (it) (a-get it 'name)) (oref gitlab labels)))
          (labels-str (string-join labels ",")))
-    (glab-put (format "/v4/projects/%s/merge_requests/%s"
+    (ghub-put (format "/v4/projects/%s/merge_requests/%s"
                       (code-review-gitlab--project-id gitlab)
                       (oref gitlab number))
               nil
               :auth code-review-auth-login-marker
               :host code-review-gitlab-host
               :payload `((labels .,labels-str))
-              :callback (lambda (&rest _) (funcall callback)))))
+              :callback (lambda (&rest _) (funcall callback))
+	      :forge 'gitlab)))
 
 (cl-defmethod code-review-get-assignees ((_gitlab code-review-gitlab-repo))
   "Get assignees for your pr at GITLAB."
@@ -558,14 +566,15 @@ Optionally sets FALLBACK? to get minimal query."
 
 (cl-defmethod code-review-send-title ((gitlab code-review-gitlab-repo) callback)
   "Set title for your pr in GITLAB and call CALLBACK."
-  (glab-put (format "/v4/projects/%s/merge_requests/%s"
+  (ghub-put (format "/v4/projects/%s/merge_requests/%s"
                     (code-review-gitlab--project-id gitlab)
                     (oref gitlab number))
             nil
             :auth code-review-auth-login-marker
             :host code-review-gitlab-host
             :payload `((title .,(oref gitlab title)))
-            :callback (lambda (&rest _) (funcall callback))))
+            :callback (lambda (&rest _) (funcall callback))
+	    :forge 'gitlab))
 
 (cl-defmethod code-review-send-description ((_gitlab code-review-gitlab-repo) _callback)
   "Set description for your pr in GITLAB and call CALLBACK."
@@ -604,7 +613,7 @@ Return the blob URL if BLOB? is provided."
 
 (cl-defmethod code-review-new-issue-comment ((gitlab code-review-gitlab-repo) comment-msg callback)
   "Create a new comment issue for GITLAB sending the COMMENT-MSG and call CALLBACK."
-  (glab-post (format "/v4/projects/%s/merge_requests/%s/notes"
+  (ghub-post (format "/v4/projects/%s/merge_requests/%s/notes"
                      (code-review-gitlab--project-id gitlab)
                      (oref gitlab number))
              nil
@@ -612,7 +621,8 @@ Return the blob URL if BLOB? is provided."
              :host code-review-gitlab-host
              :payload (a-alist 'body comment-msg)
              :callback callback
-             :errorback #'code-review-gitlab-errback))
+             :errorback #'code-review-gitlab-errback
+	     :forge 'gitlab))
 
 (cl-defmethod code-review-new-code-comment ((gitlab code-review-gitlab-repo) local-comment callback)
   "Creare a new code comment in GITLAB from a LOCAL-COMMENT and call CALLBACK."
@@ -624,7 +634,7 @@ Return the blob URL if BLOB? is provided."
                                               'start_sha (a-get-in infos (list 'diffRefs 'startSha))
                                               'new_path (oref local-comment path)
                                               'old_path (oref local-comment path)))))
-    (glab-post (format "/v4/projects/%s/merge_requests/%s/discussions"
+    (ghub-post (format "/v4/projects/%s/merge_requests/%s/discussions"
                        (code-review-gitlab--project-id gitlab)
                        (oref gitlab number))
                nil
@@ -635,7 +645,8 @@ Return the blob URL if BLOB? is provided."
                            (message "Review Comments successfully!")
                            (sit-for 0.5)
                            (funcall callback))
-               :errorback #'code-review-gitlab-errback)))
+               :errorback #'code-review-gitlab-errback
+	       :forge 'gitlab)))
 
 (provide 'code-review-gitlab)
 ;;; code-review-gitlab.el ends here
